@@ -1384,7 +1384,36 @@ handle_special() {
             exit 0
             ;;
         --update)
-            echo -e "  ${YELLOW}⚠ 更新功能需要网络连接，请从 GitHub 获取最新版本${RESET}"
+            echo -e "  ${BOLD}正在检查更新...${RESET}"
+            echo ""
+            local tmp_file="/tmp/fake_update"
+            local github_raw="https://raw.githubusercontent.com/tang7hheng/fake/main/fake"
+            if command -v curl &>/dev/null; then
+                if curl -fsSL "$github_raw" -o "$tmp_file" 2>/dev/null; then
+                    sudo cp "$tmp_file" /usr/local/bin/fake 2>/dev/null && \
+                    sudo chmod +x /usr/local/bin/fake 2>/dev/null
+                    echo -e "  ${GREEN}✅ 已更新到最新版本${RESET}"
+                    echo -e "  ${GRAY}GitHub: https://github.com/tang7hheng/fake${RESET}"
+                    rm -f "$tmp_file"
+                else
+                    echo -e "  ${YELLOW}⚠ 下载失败，请检查网络连接${RESET}"
+                    echo -e "  ${GRAY}也可以手动更新: git clone https://github.com/tang7hheng/fake.git${RESET}"
+                fi
+            elif command -v wget &>/dev/null; then
+                if wget -qO "$tmp_file" "$github_raw" 2>/dev/null; then
+                    sudo cp "$tmp_file" /usr/local/bin/fake 2>/dev/null && \
+                    sudo chmod +x /usr/local/bin/fake 2>/dev/null
+                    echo -e "  ${GREEN}✅ 已更新到最新版本${RESET}"
+                    echo -e "  ${GRAY}GitHub: https://github.com/tang7hheng/fake${RESET}"
+                    rm -f "$tmp_file"
+                else
+                    echo -e "  ${YELLOW}⚠ 下载失败，请检查网络连接${RESET}"
+                    echo -e "  ${GRAY}也可以手动更新: git clone https://github.com/tang7hheng/fake.git${RESET}"
+                fi
+            else
+                echo -e "  ${YELLOW}⚠ 需要 curl 或 wget 来更新${RESET}"
+                echo -e "  ${GRAY}也可以手动更新: git clone https://github.com/tang7hheng/fake.git${RESET}"
+            fi
             exit 0
             ;;
         -h|--help|help)

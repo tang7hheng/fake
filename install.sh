@@ -2,9 +2,12 @@
 # ═══════════════════════════════════════════════════════════════
 #  fake 安装脚本
 #  用法: sudo bash install.sh
-#        curl -fsSL https://xxx/install.sh | sudo bash
+#        curl -fsSL https://raw.githubusercontent.com/tang7hheng/fake/main/install.sh | sudo bash
 # ═══════════════════════════════════════════════════════════════
 set -eo pipefail 2>/dev/null || true
+
+GITHUB_RAW="https://raw.githubusercontent.com/tang7hheng/fake/main"
+GITHUB_REPO="https://github.com/tang7hheng/fake.git"
 
 BOLD="\033[1m"
 GREEN="\033[32m"
@@ -88,17 +91,35 @@ install_xclip() {
 
 # ── 安装 fake ──────────────────────────────────────────
 install_fake() {
+    local fake_src=""
     local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local fake_src="$script_dir/fake"
 
-    # 如果是通过 curl 安装的，fake 可能在临时目录
-    if [[ ! -f "$fake_src" ]]; then
-        # 尝试从当前目录找
+    # 1. 尝试从脚本同目录找
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || true
+    if [[ -f "$script_dir/fake" ]]; then
+        fake_src="$script_dir/fake"
+    elif [[ -f "./fake" ]]; then
         fake_src="./fake"
     fi
-    if [[ ! -f "$fake_src" ]]; then
-        fail "找不到 fake 文件" "请确保 fake 和 install.sh 在同一目录"
+
+    # 2. 本地找不到，从 GitHub 下载
+    if [[ -z "$fake_src" ]]; then
+        echo -e "  ${DIM}  从 GitHub 下载 fake...${RESET}"
+        local tmp_file="/tmp/fake_download"
+        if command -v curl &>/dev/null; then
+            if curl -fsSL "$GITHUB_RAW/fake" -o "$tmp_file" 2>/dev/null; then
+                fake_src="$tmp_file"
+            fi
+        elif command -v wget &>/dev/null; then
+            if wget -qO "$tmp_file" "$GITHUB_RAW/fake" 2>/dev/null; then
+                fake_src="$tmp_file"
+            fi
+        fi
+    fi
+
+    if [[ -z "$fake_src" || ! -f "$fake_src" ]]; then
+        fail "找不到 fake 文件" "请确保 fake 和 install.sh 在同一目录，或检查网络连接"
+        echo -e "       ${DIM}也可以手动克隆: git clone $GITHUB_REPO${RESET}"
         return 1
     fi
 
