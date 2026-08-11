@@ -1,0 +1,1596 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════════
+#  fake - Linux 命令快速查询工具
+#  用法: fake [关键词]   查询命令
+#        fake 12 4 5     快捷跳转 模块>子分类>命令
+#        fake --detect   重新检测系统
+#        fake --inject   重新注入 Shell 函数
+#        fake --doctor    运行诊断
+#        fake -h          显示帮助
+# ═══════════════════════════════════════════════════════════════
+set -eo pipefail 2>/dev/null || true
+shopt -s inherit_errexit 2>/dev/null || true
+
+VERSION="1.0.0"
+CONF_FILE="$HOME/.fake.conf"
+HISTORY_FILE="$HOME/.fake_history"
+FAKE_CMD_FILE="/tmp/_fake_cmd"
+MAX_HISTORY=5
+
+# ── 颜色定义 ──────────────────────────────────────────────
+BOLD="\033[1m"
+DIM="\033[2m"
+CYAN="\033[36m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+WHITE="\033[97m"
+GRAY="\033[90m"
+BG_CYAN="\033[46m"
+BG_GRAY="\033[100m"
+RESET="\033[0m"
+CURSOR_HIDE="\033[?25l"
+CURSOR_SHOW="\033[?25h"
+CLEAR_LINE="\033[2K\r"
+
+# ── 加载系统缓存 ──────────────────────────────────────────
+load_config() {
+    if [[ -f "$CONF_FILE" ]]; then
+        source "$CONF_FILE" 2>/dev/null || true
+        # 校验
+        if [[ -z "$SYS_TAG" ]] || ! echo "$SYS_TAG" | grep -qE "^(deb|rhel|arch|suse)$"; then
+            detect_system
+        fi
+        # 校验剪贴板工具是否还存在
+        if [[ -n "$CLIP_CMD" ]] && ! command -v "$CLIP_CMD" &>/dev/null; then
+            detect_clipboard
+            save_config
+        fi
+    else
+        detect_system
+        detect_clipboard
+        save_config
+    fi
+}
+
+detect_system() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        local id="${ID:-unknown}"
+        local vid="${VERSION_ID:-0}"
+        SYS_VERSION_ID="$vid"
+        case "$id" in
+            ubuntu|debian|linuxmint|pop!_os) SYS_TAG="deb" ;;
+            centos|rhel|rocky|almalinux|fedora) SYS_TAG="rhel" ;;
+            arch|manjaro|endeavouros) SYS_TAG="arch" ;;
+            opensuse-leap|opensuse-tumbleweed|sles) SYS_TAG="suse" ;;
+            *) SYS_TAG="unknown" ;;
+        esac
+    else
+        SYS_TAG="unknown"
+        SYS_VERSION_ID="0"
+    fi
+}
+
+detect_clipboard() {
+    for tool in xclip xsel wl-copy pbcopy; do
+        if command -v "$tool" &>/dev/null; then
+            CLIP_CMD="$tool"
+            case "$tool" in
+                xclip) CLIP_ARGS="-selection clipboard" ;;
+                xsel) CLIP_ARGS="--clipboard --input" ;;
+                wl-copy) CLIP_ARGS="" ;;
+                pbcopy) CLIP_ARGS="" ;;
+            esac
+            return
+        fi
+    done
+    CLIP_CMD=""
+    CLIP_ARGS=""
+}
+
+save_config() {
+    cat > "$CONF_FILE" <<EOF
+SYS_TAG=$SYS_TAG
+SYS_VERSION_ID=$SYS_VERSION_ID
+CLIP_CMD=$CLIP_CMD
+CLIP_ARGS=$CLIP_ARGS
+EOF
+}
+
+# ── 剪贴板复制 ────────────────────────────────────────────
+copy_to_clipboard() {
+    local text="$1"
+    if [[ -n "$CLIP_CMD" ]]; then
+        if [[ -n "$CLIP_ARGS" ]]; then
+            echo -n "$text" | "$CLIP_CMD" $CLIP_ARGS 2>/dev/null && return 0
+        else
+            echo -n "$text" | "$CLIP_CMD" 2>/dev/null && return 0
+        fi
+    fi
+    return 1
+}
+
+# ── 历史记录 ──────────────────────────────────────────────
+add_history() {
+    local cmd="$1" desc="$2" src="$3"
+    local entry="${cmd}|${desc}|${src}"
+    # 去重：如果已存在则移到最前
+    local tmp=""
+    local found=0
+    if [[ -f "$HISTORY_FILE" ]]; then
+        while IFS= read -r line; do
+            if [[ "$line" == "${cmd}|"* ]]; then
+                found=1
+                continue
+            fi
+            tmp="${tmp}${line}"$'\n'
+        done < "$HISTORY_FILE"
+    fi
+    # 写入：新记录在最前
+    echo "$entry" > "$HISTORY_FILE"
+    if [[ -n "$tmp" ]]; then
+        echo -n "$tmp" >> "$HISTORY_FILE"
+    fi
+    # 只保留最近 MAX_HISTORY 条
+    local count
+    count=$(wc -l < "$HISTORY_FILE")
+    if (( count > MAX_HISTORY )); then
+        tail -n "$MAX_HISTORY" "$HISTORY_FILE" > "$HISTORY_FILE.tmp"
+        mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+    fi
+}
+
+load_history() {
+    HISTORY=()
+    if [[ -f "$HISTORY_FILE" ]]; then
+        while IFS='|' read -r cmd desc src; do
+            [[ -n "$cmd" ]] && HISTORY+=("$cmd|$desc")
+        done < "$HISTORY_FILE"
+    fi
+}
+
+# ── 命令数据库 ──────────────────────────────────────────
+# 格式: "命令|说明" 无后缀=通用  @后缀=系统过滤
+# 子分类用 "## 子分类名" 分隔
+
+declare -a MODULE_NAMES
+declare -a MODULE_TAGS
+declare -A MODULE_DATA
+
+init_commands() {
+    # ── 模块0: 文件操作 ──
+    MODULE_NAMES+=("文件操作")
+    MODULE_TAGS+=("文件|目录|复制|删除|移动|查找|权限|file|dir|copy|delete")
+    MODULE_DATA["文件操作"]=$(cat <<'INNER'
+## 查看与浏览
+ls|列出当前目录文件
+ls -a|列出所有文件（含隐藏文件）
+ls -lh|详细信息 + KB/MB/GB 显示
+ls -R|递归列出子目录内容
+tree {目录}|树形显示目录结构
+file {文件}|查看文件类型
+## 复制与移动
+cp {源文件} {目标路径}|复制文件
+cp -r {源目录} {目标路径}|复制整个目录
+cp -a {源} {目标}|完整复制（保留权限/时间戳）
+mv {源文件} {目标路径}|移动/重命名文件
+rm {文件}|删除文件
+rm -r {目录}|删除目录及内容
+rm -rf {目录}|强制删除目录（不提示，慎用）
+rm -i {文件}|删除前逐个确认
+## 创建与链接
+mkdir {目录名}|创建目录
+mkdir -p {路径/目录名}|递归创建多级目录
+touch {文件名}|创建空文件/更新时间戳
+ln -s {目标} {链接名}|创建软链接
+ln {目标} {链接名}|创建硬链接
+## 权限与归属
+chmod {权限码} {文件}|修改权限（如 755）
+chmod +x {脚本文件}|添加执行权限
+chmod -R {权限码} {目录}|递归修改目录权限
+chown {用户}:{组} {文件}|修改文件所有者
+chown -R {用户}:{组} {目录}|递归修改目录所有者
+## 查找与定位
+find {目录} -name "{名称}"|按名称查找文件
+find {目录} -name "*.log"|查找所有日志文件
+find {目录} -type f|只查找文件
+find {目录} -type d|只查找目录
+find {目录} -size +{大小}M|查找大于指定大小的文件
+find {目录} -mtime +{天数}|查找N天前修改的文件
+locate {关键词}|快速查找文件（需预建数据库）
+which {命令名}|查找命令所在路径
+## 空间统计
+du -sh {目录}|查看目录总大小
+du -sh *|查看当前目录下各项大小
+df -h|查看磁盘使用情况
+ncdu {目录}|交互式磁盘占用分析
+INNER
+    )
+
+    # ── 模块1: 文本处理 ──
+    MODULE_NAMES+=("文本处理")
+    MODULE_TAGS+=("文本|搜索|替换|排序|统计|grep|sed|awk|text|search")
+    MODULE_DATA["文本处理"]=$(cat <<'INNER'
+## 查看文件
+cat {文件}|输出文件全部内容
+cat -n {文件}|显示行号
+less {文件}|分页查看文件（可上下翻）
+more {文件}|分页查看文件（只能向下）
+head -n {行数} {文件}|查看文件前N行
+tail -n {行数} {文件}|查看文件后N行
+tail -f {日志文件}|实时追踪日志更新
+## 搜索匹配
+grep "{关键词}" {文件}|在文件中搜索
+grep -r "{关键词}" {目录}|递归搜索整个目录
+grep -i "{关键词}" {文件}|忽略大小写搜索
+grep -n "{关键词}" {文件}|显示行号
+grep -v "{排除词}" {文件}|反向匹配（排除该词的行）
+grep -E "{正则}" {文件}|正则表达式搜索
+grep -c "{关键词}" {文件}|统计匹配行数
+## 排序去重
+sort {文件}|按行排序
+sort -r {文件}|倒序排序
+sort -n {文件}|按数字大小排序
+sort -u {文件}|去重排序
+uniq|去除相邻重复行
+## 统计计数
+wc -l {文件}|统计行数
+wc {文件}|统计行数/单词数/字节数
+## 替换与处理
+sed -i 's/{旧}/{新}/g' {文件}|全局替换文本
+sed -n '{起始},{结束}p' {文件}|打印指定行范围
+awk '{print $1}' {文件}|提取第1列
+awk -F'{分隔符}' '{print $N}' {文件}|按分隔符提取第N列
+cut -d'{分隔符}' -f{列号} {文件}|按分隔符截取列
+tr '{旧字符}' '{新字符}'|替换字符（管道中使用）
+## 比较与管道
+diff {文件1} {文件2}|比较两个文件差异
+tee {文件}|从 stdin 同时输出到屏幕和文件
+xargs|将 stdin 数据转为命令参数
+INNER
+    )
+
+    # ── 模块2: 网络管理 ──
+    MODULE_NAMES+=("网络管理")
+    MODULE_TAGS+=("网络|ssh|scp|下载|请求|ping|端口|连接|network|download")
+    MODULE_DATA["网络管理"]=$(cat <<'INNER'
+## 远程连接
+ssh {用户}@{主机}|远程登录
+ssh -p {端口} {用户}@{主机}|指定端口登录
+ssh -i {密钥文件} {用户}@{主机}|用密钥文件登录
+scp {本地文件} {用户}@{主机}:{路径}|上传文件到远程
+scp {用户}@{主机}:{文件} {本地路径}|从远程下载文件
+scp -r {本地目录} {用户}@{主机}:{路径}|上传整个目录
+scp -P {端口} {文件} {用户}@{主机}:{路径}|指定端口传输
+sftp {用户}@{主机}|交互式文件传输
+## 下载与请求
+wget {下载链接}|下载文件
+wget -c {下载链接}|断点续传下载
+wget -O {保存文件名} {链接}|下载并重命名
+curl {网址}|请求网页/接口
+curl -X POST -d "{数据}" {网址}|发送POST请求
+curl -o {保存文件名} {网址}|下载并保存
+curl -I {网址}|只查看响应头
+curl -H "{头部}" {网址}|自定义请求头
+## 网络诊断
+ping {主机地址}|测试网络连通性
+ping -c {次数} {主机}|指定ping次数
+traceroute {主机地址}|追踪路由跳转
+nslookup {域名}|查询DNS解析
+dig {域名}|详细DNS查询
+## 端口与连接
+ss -tlnp|查看监听端口
+ss -antp|查看所有TCP连接
+ip addr show|查看本机IP地址
+ip route show|查看路由表
+netstat -tlnp|查看监听端口（旧版）
+INNER
+    )
+
+    # ── 模块3: 系统管理 ──
+    MODULE_NAMES+=("系统管理")
+    MODULE_TAGS+=("系统|进程|内存|CPU|信息|system|process|memory|top|ps")
+    MODULE_DATA["系统管理"]=$(cat <<'INNER'
+## 进程监控
+top|实时查看进程（按CPU排序）
+htop|进程监控（更好看的top）
+ps aux|查看所有运行中的进程
+ps aux | grep {关键词}|筛选指定进程
+## 进程控制
+kill {进程ID}|终止进程
+kill -9 {进程ID}|强制终止进程
+killall {进程名}|按名称终止所有同名进程
+pkill -f {关键词}|按关键词终止进程
+lsof -i :{端口号}|查看占用指定端口的进程
+nohup {命令} &|后台运行（退出终端不中断）
+## 系统信息
+uname -a|查看系统内核信息
+uname -r|只看内核版本
+hostnamectl|查看完整系统信息
+uptime|查看运行时长和负载
+date|查看当前时间
+timedatectl|查看时区和时间设置
+## 资源监控
+free -h|查看内存使用情况
+lscpu|查看CPU信息
+lsblk|查看磁盘和分区
+dmesg|查看内核启动日志
+## 命令历史
+history|查看命令历史
+!!|重复执行上一条命令
+sudo !!|用sudo重复上一条命令
+INNER
+    )
+
+    # ── 模块4: 用户权限 ──
+    MODULE_NAMES+=("用户权限")
+    MODULE_TAGS+=("用户|权限|sudo|组|user|password|group|permission")
+    MODULE_DATA["用户权限"]=$(cat <<'INNER'
+## 用户管理
+sudo {命令}|以管理员身份执行
+su - {用户名}|切换到指定用户
+whoami|查看当前用户名
+id {用户名}|查看用户ID和组信息
+useradd -m {用户名}|创建新用户（含主目录）
+userdel -r {用户名}|删除用户（含主目录）
+passwd {用户名}|设置/修改用户密码
+usermod -aG {组名} {用户名}|将用户加入组
+## 组管理
+groupadd {组名}|创建用户组
+groupdel {组名}|删除用户组
+groups {用户名}|查看用户所属的组
+cat /etc/passwd|查看所有用户
+cat /etc/group|查看所有用户组
+## 高级权限
+ls -la {文件}|查看文件详细权限
+getfacl {文件}|查看文件ACL权限
+setfacl -m u:{用户}:{权限} {文件}|设置ACL权限
+INNER
+    )
+
+    # ── 模块5: 软件包管理 ──
+    local pkg_data=""
+    case "$SYS_TAG" in
+        deb)
+            pkg_data=$(cat <<'INNER'
+## 安装与卸载
+apt install {包名}|安装软件包
+apt install -y {包名}|安装（不询问确认）
+apt remove {包名}|卸载软件包
+apt purge {包名}|卸载并删除配置文件
+apt autoremove|清理不再需要的依赖
+## 搜索与查看
+apt search {关键词}|搜索软件包
+apt show {包名}|查看包详细信息
+apt list --installed|查看已安装的包
+dpkg -l|查看所有已安装的包（详细）
+## 更新与升级
+apt update|更新软件源列表
+apt upgrade -y|升级所有已安装软件
+apt clean|清理下载缓存
+## 手动安装
+dpkg -i {deb包路径}|手动安装 deb 包
+apt source {包名}|下载源码包
+INNER
+            )
+            ;;
+        rhel)
+            local y_or_dnf="dnf"
+            if [[ -n "${SYS_VERSION_ID:-}" ]] && echo "$SYS_VERSION_ID" | grep -qE "^[0-6]\."; then
+                y_or_dnf="yum"
+            fi
+            if [[ "$y_or_dnf" == "yum" ]]; then
+                pkg_data=$(cat <<'INNER'
+## 安装与卸载
+yum install {包名}|安装软件包
+yum install -y {包名}|安装（不询问确认）
+yum remove {包名}|卸载软件包
+yum autoremove|清理不再需要的依赖
+## 搜索与查看
+yum search {关键词}|搜索软件包
+yum info {包名}|查看包详细信息
+yum list installed|查看已安装的包
+rpm -qa|查看所有已安装的包
+## 更新与升级
+yum makecache|更新软件缓存
+yum update -y|升级所有已安装软件
+yum clean all|清理缓存
+## 手动安装
+rpm -ivh {rpm包路径}|手动安装 rpm 包
+yum history list|查看操作历史
+yum provides {文件名}|查看哪个包提供该文件
+INNER
+                )
+            else
+                pkg_data=$(cat <<'INNER'
+## 安装与卸载
+dnf install {包名}|安装软件包
+dnf install -y {包名}|安装（不询问确认）
+dnf remove {包名}|卸载软件包
+dnf autoremove|清理不再需要的依赖
+## 搜索与查看
+dnf search {关键词}|搜索软件包
+dnf info {包名}|查看包详细信息
+dnf list installed|查看已安装的包
+rpm -qa|查看所有已安装的包
+rpm -qi {包名}|查看已安装包的详细信息
+## 更新与升级
+dnf check-update|检查可用更新
+dnf upgrade -y|升级所有已安装软件
+dnf clean all|清理缓存
+## 手动安装
+rpm -ivh {rpm包路径}|手动安装 rpm 包
+dnf history list|查看操作历史
+dnf provides {文件名}|查看哪个包提供该文件
+INNER
+                )
+            fi
+            ;;
+        arch)
+            pkg_data=$(cat <<'INNER'
+## 安装与卸载
+pacman -S {包名}|安装软件包
+pacman -R {包名}|卸载软件包
+pacman -Rs {包名}|卸载并清理依赖
+pacman -Rns {包名}|卸载+依赖+配置
+## 搜索与查看
+pacman -Ss {关键词}|搜索软件包
+pacman -Si {包名}|查看包详细信息
+pacman -Q|查看所有已安装的包
+pacman -Qi {包名}|查看已安装包的详细信息
+## 更新与升级
+pacman -Sy|同步软件数据库
+pacman -Syu|更新整个系统
+## 手动安装
+pacman -U {pkg.tar.zst}|手动安装本地包
+pacman -Sc|清理未使用的缓存
+pacman -Scc|清理所有缓存
+pacman -F {文件名}|查看哪个包拥有该文件
+INNER
+            )
+            ;;
+        suse)
+            pkg_data=$(cat <<'INNER'
+## 安装与卸载
+zypper install {包名}|安装软件包
+zypper remove {包名}|卸载软件包
+## 搜索与查看
+zypper search {关键词}|搜索软件包
+zypper info {包名}|查看包详细信息
+zypper search --installed-only|查看已安装的包
+## 更新与升级
+zypper refresh|刷新软件源
+zypper update -y|更新所有已安装软件
+zypper dup|发行版升级
+zypper clean|清理缓存
+## 手动安装
+zypper install {rpm包路径}|手动安装 rpm 包
+zypper lr|列出所有软件源
+zypper pa|列出所有可用包
+INNER
+            )
+            ;;
+        *)
+            pkg_data=$(cat <<'INNER'
+## 通用
+# 请使用对应发行版的包管理器
+# deb: apt    rhel: dnf/yum    arch: pacman    suse: zypper
+INNER
+            )
+            ;;
+    esac
+    MODULE_NAMES+=("软件包管理")
+    MODULE_TAGS+=("包|安装|卸载|更新|软件|package|install|apt|dnf|yum|pacman|zypper")
+    MODULE_DATA["软件包管理"]="$pkg_data"
+
+    # ── 模块6: 磁盘与挂载 ──
+    MODULE_NAMES+=("磁盘与挂载")
+    MODULE_TAGS+=("磁盘|挂载|分区|格式化|disk|mount|partition|df|du")
+    MODULE_DATA["磁盘与挂载"]=$(cat <<'INNER'
+## 磁盘查看
+df -h|查看磁盘使用情况
+df -i|查看inode使用情况
+df -Th|查看磁盘类型+使用情况
+lsblk|查看所有磁盘和分区
+lsblk -f|查看分区文件系统类型
+fdisk -l|查看所有磁盘分区详情
+parted -l|查看分区表（支持GPT）
+blkid|查看分区UUID和类型
+## 挂载卸载
+mount {设备} {挂载点}|挂载设备
+umount {挂载点}|卸载设备
+mount -o loop {镜像文件} {挂载点}|挂载ISO镜像
+mount -t {类型} {设备} {挂载点}|指定文件系统类型挂载
+## 格式化与修复
+mkfs.ext4 {设备}|格式化为ext4
+mkfs.xfs {设备}|格式化为xfs
+fsck {设备}|检查并修复文件系统
+fdisk {设备}|分区操作（交互式）
+INNER
+    )
+
+    # ── 模块7: 进程与服务 ──
+    MODULE_NAMES+=("进程与服务")
+    MODULE_TAGS+=("服务|systemctl|日志|定时|service|cron|journalctl")
+    MODULE_DATA["进程与服务"]=$(cat <<'INNER'
+## 服务管理
+systemctl start {服务名}|启动服务
+systemctl stop {服务名}|停止服务
+systemctl restart {服务名}|重启服务
+systemctl status {服务名}|查看服务状态
+systemctl enable {服务名}|设置开机自启
+systemctl disable {服务名}|取消开机自启
+systemctl is-enabled {服务名}|查看是否开机自启
+systemctl list-units --type=service|列出所有服务
+systemctl daemon-reload|重新加载服务配置
+## 日志查看
+journalctl -u {服务名} -f|实时查看服务日志
+journalctl --since "{时间}"|查看指定时间后的日志
+journalctl --since today|查看今天的日志
+journalctl -n {行数}|查看最近N行日志
+## 定时任务
+crontab -l|查看当前定时任务
+crontab -e|编辑定时任务
+crontab -r|删除所有定时任务
+INNER
+    )
+
+    # ── 模块8: 压缩解压 ──
+    MODULE_NAMES+=("压缩解压")
+    MODULE_TAGS+=("压缩|解压|打包|tar|zip|gzip|compress|archive")
+    MODULE_DATA["压缩解压"]=$(cat <<'INNER'
+## tar 打包
+tar -czvf {包名}.tar.gz {文件或目录}|打包并gzip压缩
+tar -cjvf {包名}.tar.bz2 {文件或目录}|打包并bz2压缩
+tar -tzvf {包名}.tar.gz|列出包内文件
+tar -rvf {包名}.tar {要追加的文件}|往已有包追加文件
+## tar 解压
+tar -xzvf {包名}.tar.gz|解压.gz到当前目录
+tar -xjvf {包名}.tar.bz2|解压.bz2到当前目录
+tar -xzvf {包名}.tar.gz -C {目标目录}|解压到指定目录
+## zip 格式
+zip -r {包名}.zip {文件或目录}|压缩为zip
+unzip {包名}.zip|解压zip到当前目录
+unzip {包名}.zip -d {目标目录}|解压zip到指定目录
+## 单文件压缩
+gzip {文件}|压缩单个文件（生成.gz）
+gunzip {文件}.gz|解压.gz文件
+bzip2 {文件}|压缩单个文件（生成.bz2）
+bunzip2 {文件}.bz2|解压.bz2文件
+zcat {文件}.gz|不解压直接查看gz内容
+INNER
+    )
+
+    # ── 模块9: 防火墙 ──
+    MODULE_NAMES+=("防火墙")
+    MODULE_TAGS+=("防火墙|端口|ufw|firewall|iptables|firewall-cmd|端口开放")
+    local fw_data=""
+    case "$SYS_TAG" in
+        deb)
+            fw_data=$(cat <<'INNER'
+## 状态与开关
+ufw status verbose|查看防火墙状态和规则
+ufw enable|启用防火墙
+ufw disable|关闭防火墙
+ufw reload|重载防火墙
+ufw reset|重置所有规则
+## 规则管理
+ufw allow {端口}/tcp|允许指定端口
+ufw allow {端口}/udp|允许指定UDP端口
+ufw allow {服务名}|允许指定服务（如ssh）
+ufw deny {端口}/tcp|拒绝指定端口
+ufw delete allow {端口}/tcp|删除规则
+ufw allow from {IP地址}|允许指定IP访问
+## 查看信息
+ufw app list|列出可用应用配置
+INNER
+            )
+            ;;
+        rhel|suse)
+            fw_data=$(cat <<'INNER'
+## 状态与重载
+firewall-cmd --list-all|查看所有规则
+firewall-cmd --state|查看防火墙状态
+firewall-cmd --reload|重载防火墙（使permanent生效）
+firewall-cmd --get-active-zones|查看活跃区域
+firewall-cmd --list-all --zone=public|查看指定区域规则
+## 规则管理
+firewall-cmd --permanent --add-port={端口}/tcp|永久开放端口
+firewall-cmd --permanent --add-service={服务名}|永久开放服务
+firewall-cmd --permanent --remove-port={端口}/tcp|永久关闭端口
+firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="{IP}" accept'|允许指定IP
+firewall-cmd --permanent --add-port={起始}-{结束}/tcp|开放端口范围
+## 查看信息
+firewall-cmd --list-ports|查看已开放的端口
+INNER
+            )
+            ;;
+        *)
+            fw_data=$(cat <<'INNER'
+## 通用
+iptables -L -n -v|查看所有规则
+iptables -A INPUT -p tcp --dport {端口} -j ACCEPT|允许端口
+iptables -A INPUT -p tcp --dport {端口} -j DROP|拒绝端口
+iptables -D INPUT -p tcp --dport {端口} -j ACCEPT|删除规则
+iptables -F|清空所有规则
+INNER
+            )
+            ;;
+    esac
+    MODULE_DATA["防火墙"]="$fw_data"
+
+    # ── 模块10: 安全模块 ──
+    MODULE_NAMES+=("安全模块")
+    MODULE_TAGS+=("安全|SELinux|AppArmor|sestatus|aa-status|selinux|apparmor")
+    local sec_data=""
+    case "$SYS_TAG" in
+        rhel)
+            sec_data=$(cat <<'INNER'
+## 状态查看
+sestatus|查看 SELinux 状态
+getenforce|查看当前模式
+## 模式切换
+setenforce 0|临时设为 Permissive
+setenforce 1|临时设为 Enforcing
+## 上下文管理
+getsebool -a|查看所有布尔值
+setsebool -P {布尔值} 1|永久开启某布尔值
+semanage fcontext -l|查看文件上下文
+restorecon -Rv {目录}|恢复默认文件上下文
+INNER
+            )
+            ;;
+        deb)
+            sec_data=$(cat <<'INNER'
+## 状态查看
+aa-status|查看 AppArmor 状态
+## 模式管理
+aa-disable {配置文件}|禁用指定配置
+aa-enforce {配置文件}|设为强制模式
+aa-complain {配置文件}|设为告警模式
+INNER
+            )
+            ;;
+        *)
+            sec_data=$(cat <<'INNER'
+## 当前系统无默认安全模块
+# RHEL/CentOS/Fedora 使用 SELinux
+# Ubuntu/Debian 使用 AppArmor
+INNER
+            )
+            ;;
+    esac
+    MODULE_DATA["安全模块"]="$sec_data"
+
+    # ── 模块11: 开发工具 ──
+    MODULE_NAMES+=("开发工具")
+    MODULE_TAGS+=("开发|git|docker|npm|python|mysql|redis|nginx|vim|开发工具")
+    MODULE_DATA["开发工具"]=$(cat <<'INNER'
+## Git - 仓库操作
+git init|初始化仓库
+git clone {仓库地址}|克隆远程仓库
+git clone -b {分支} {仓库地址}|克隆指定分支
+git remote -v|查看远程仓库地址
+## Git - 暂存与提交
+git add {文件}|添加文件到暂存区
+git add .|添加所有改动
+git add -p|交互式选择要添加的改动
+git commit -m "{提交信息}"|提交更改
+git commit --amend|修改上一次提交
+## Git - 分支管理
+git branch|查看所有分支
+git branch {分支名}|创建分支
+git branch -d {分支名}|删除分支
+git checkout {分支名}|切换分支
+git checkout -b {分支名}|创建并切换到新分支
+git switch {分支名}|切换分支（新版）
+git merge {分支名}|合并分支
+git rebase {分支名}|变基操作
+## Git - 远程同步
+git push {远程名} {分支名}|推送到远程
+git push -u origin {分支名}|推送并设置上游分支
+git pull {远程名} {分支名}|拉取远程更新
+git fetch {远程名}|获取远程更新（不合并）
+## Git - 查看与比较
+git status|查看当前状态
+git diff|查看未暂存的改动
+git diff --staged|查看已暂存的改动
+git log --oneline|查看提交历史（简洁版）
+git log --graph --oneline|图形化查看分支历史
+## Git - 暂存与撤销
+git stash|暂存当前改动
+git stash pop|恢复暂存的改动
+git stash list|查看所有暂存
+git stash drop|删除暂存
+git reset --soft HEAD~1|撤销上一次提交（保留改动）
+git reset --hard HEAD~1|回退到上一次提交（丢弃改动）
+## Git - 标签
+git tag {标签名}|创建标签
+git tag -a {标签名} -m "{说明}"|创建带说明的标签
+git cherry-pick {commit}|摘取指定提交
+## Node.js / npm
+node {文件.js}|运行 JS 文件
+node -v|查看 Node 版本
+npm init|初始化项目
+npm install|安装所有依赖
+npm install {包名}|安装指定包
+npm install -g {包名}|全局安装
+npm install -D {包名}|安装开发依赖
+npm run {脚本名}|运行脚本
+npm update|更新所有依赖
+npm uninstall {包名}|卸载包
+npm list|查看已安装的包
+npm list -g --depth=0|查看全局安装的包
+npm audit|检查安全漏洞
+npx {包名}|直接运行包
+npx create-vite {项目名}|创建 Vite 项目
+## Python / pip
+python3 {文件.py}|运行 Python 文件
+python3 -m http.server {端口}|快速启动HTTP服务器
+pip3 install {包名}|安装包
+pip3 install -r requirements.txt|从文件批量安装
+pip3 install --upgrade {包名}|升级包
+pip3 uninstall {包名}|卸载包
+pip3 list|查看已安装的包
+pip3 freeze > requirements.txt|导出依赖列表
+python3 -m venv {目录名}|创建虚拟环境
+source {目录名}/bin/activate|激活虚拟环境
+deactivate|退出虚拟环境
+## Docker - 镜像操作
+docker pull {镜像名}:{标签}|拉取镜像
+docker images|查看本地镜像
+docker rmi {镜像ID}|删除镜像
+docker build -t {镜像名}:{标签} {Dockerfile路径}|构建镜像
+## Docker - 容器运行
+docker run -d -p {主机端口}:{容器端口} {镜像}|后台运行并映射端口
+docker run -it {镜像} /bin/bash|交互式进入容器
+docker run --name {容器名} -d {镜像}|指定名称后台运行
+docker run -v {本地路径}:{容器路径} {镜像}|挂载目录
+docker run -e {变量名}={值} {镜像}|设置环境变量
+## Docker - 容器管理
+docker ps|查看运行中的容器
+docker ps -a|查看所有容器（含已停止）
+docker stop {容器ID}|停止容器
+docker start {容器ID}|启动容器
+docker restart {容器ID}|重启容器
+docker rm {容器ID}|删除容器
+docker rm -f {容器ID}|强制删除运行中的容器
+## Docker - 容器交互
+docker exec -it {容器ID} /bin/bash|进入运行中的容器
+docker logs {容器ID}|查看容器日志
+docker logs -f {容器ID}|实时查看日志
+## Docker - 系统维护
+docker system df|查看磁盘占用
+docker system prune|清理无用镜像/容器/网络
+docker network ls|查看所有网络
+docker volume ls|查看所有数据卷
+## Docker - Compose
+docker-compose up -d|启动 compose 服务
+docker-compose down|停止并移除
+docker-compose logs -f|实时查看 compose 日志
+## MySQL
+mysql -u {用户名} -p|登录 MySQL
+mysql -u {用户名} -p {数据库名}|登录并指定数据库
+mysqldump -u {用户} -p {数据库} > {备份.sql}|导出数据库
+mysql -u {用户} -p {数据库} < {备份.sql}|导入数据库
+mysql -u {用户} -p -e "{SQL语句}"|直接执行SQL
+systemctl restart mysql|重启 MySQL
+## Redis
+redis-server|启动 Redis 服务
+redis-server {配置文件}|指定配置启动
+redis-cli|连接 Redis
+redis-cli -h {主机} -p {端口}|连接指定 Redis
+redis-cli ping|测试连接
+## Nginx
+nginx|启动 Nginx
+nginx -s reload|重新加载配置（不停服）
+nginx -s stop|停止 Nginx
+nginx -t|检查配置文件是否正确
+systemctl restart nginx|通过 systemctl 重启
+## Vim
+vim {文件名}|打开/创建文件
+:wq|保存并退出
+:q!|不保存强制退出
+:w {文件名}|另存为
+:set nu|显示行号
+/{关键词}|向下搜索
+:%s/{旧}/{新}/g|全局替换
+dd|删除当前行
+yy|复制当前行
+p|粘贴
+:sp {文件名}|水平分屏
+:vsp {文件名}|垂直分屏
+INNER
+    )
+
+    # ── 模块12: fake 使用帮助 ──
+    MODULE_NAMES+=("fake 使用帮助")
+    MODULE_TAGS+=("fake|帮助|help|使用|查询|工具")
+    MODULE_DATA["fake 使用帮助"]=$(cat <<'INNER'
+## 基本查询
+fake|列出所有命令模块
+fake {关键词}|搜索命令（支持中英文）
+fake -l|列出所有模块名称
+## 系统维护
+fake --detect|重新检测系统并更新缓存
+fake --inject|重新注入 Shell 预填函数
+fake --update|检查并更新到最新版本
+fake --doctor|运行完整诊断检查
+INNER
+    )
+}
+
+# ── 解析命令数据 ──────────────────────────────────────────
+# 解析模块数据为子分类数组
+# SUBCATEGORIES[模块名] = "子分类1|子分类2|..."
+# SUB_ITEMS[模块名|子分类名] = "命令1|说明1\n命令2|说明2\n..."
+
+declare -A SUBCATEGORIES
+declare -A SUB_ITEMS
+
+parse_module() {
+    local mod_name="$1"
+    local raw_data="${MODULE_DATA[$mod_name]}"
+    local current_sub=""
+    local sub_list=""
+    local item_list=""
+
+    while IFS= read -r line; do
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        if [[ "$line" == "## "* ]]; then
+            # 保存上一个子分类
+            if [[ -n "$current_sub" ]]; then
+                SUB_ITEMS["${mod_name}|${current_sub}"]="$item_list"
+            fi
+            current_sub="${line#### }"
+            sub_list="${sub_list}${current_sub}|"
+            item_list=""
+        else
+            item_list="${item_list}${line}"$'\n'
+        fi
+    done <<< "$raw_data"
+
+    # 保存最后一个子分类
+    if [[ -n "$current_sub" ]]; then
+        SUB_ITEMS["${mod_name}|${current_sub}"]="$item_list"
+    fi
+
+    # 去掉末尾的 |
+    sub_list="${sub_list%|}"
+    SUBCATEGORIES["$mod_name"]="$sub_list"
+}
+
+parse_all_modules() {
+    for mod in "${MODULE_NAMES[@]}"; do
+        parse_module "$mod"
+    done
+}
+
+# ── 终端 UI 函数 ──────────────────────────────────────────
+# 清屏并重绘
+redraw() {
+    # 移动光标到顶部
+    echo -en "\033[${UI_TOP}H"
+    # 清除从光标到屏幕底部
+    echo -en "\033[J"
+}
+
+print_header() {
+    local title="$1"
+    echo -e "${DIM}  ─────────────────────────────────────────${RESET}"
+    echo -e "${BOLD}${CYAN}  $title${RESET}"
+    echo -e "${DIM}  ─────────────────────────────────────────${RESET}"
+}
+
+print_breadcrumb() {
+    local crumb="$1"
+    echo -e "  ${DIM}fake > $crumb${RESET}"
+}
+
+print_separator() {
+    echo -e "${DIM}  ────────────────────────────────────────────────${RESET}"
+}
+
+print_footer() {
+    local hint="$1"
+    echo -e "${DIM}  ────────────────────────────────────────────────${RESET}"
+    echo -e "  ${GRAY}$hint${RESET}"
+}
+
+# ── 方向键交互式选择 ──────────────────────────────────────
+# 用法: interactive_select "提示文字" 数组名 [返回值变量]
+# 返回: 选中的索引(0-based)，-1表示返回，-2表示退出，-3表示搜索
+interactive_select() {
+    local hint="$1"
+    local -n items="$2"
+    local -n _ret="$3"
+    local cursor=0
+    local search_input=""
+    local filtered_indices=()
+    local total=${#items[@]}
+
+    # 初始化过滤索引
+    for ((i=0; i<total; i++)); do
+        filtered_indices+=($i)
+    done
+
+    local visible_lines=$(($(tput lines 2>/dev/null || echo 24) - UI_TOP - 6))
+    (( visible_lines < 5 )) && visible_lines=5
+    local scroll_offset=0
+
+    while true; do
+        local display_count=${#filtered_indices[@]}
+
+        # 调整滚动
+        if (( cursor < scroll_offset )); then
+            scroll_offset=cursor
+        fi
+        if (( cursor >= scroll_offset + visible_lines )); then
+            scroll_offset=$((cursor - visible_lines + 1))
+        fi
+
+        # 重绘
+        echo -en "\033[${UI_TOP}H\033[J"
+
+        for ((i=0; i<display_count && i<visible_lines; i++)); do
+            local idx=${filtered_indices[$((i + scroll_offset))]}
+            local item="${items[$idx]}"
+            local num=$((idx + 1))
+
+            if (( i + scroll_offset == cursor )); then
+                echo -e "  ${BG_CYAN}${BLACK} ▶ ${item} ${RESET}"
+            else
+                echo -e "  ${GRAY}  ${item}${RESET}"
+            fi
+        done
+
+        # 底部提示
+        local line_num=$((UI_TOP + visible_lines + 2))
+        echo -en "\033[${line_num}H"
+        echo -e "  ${GRAY}↑↓ 选择  回车确认  输入关键词搜索  b 返回  q 退出${RESET}"
+
+        # 搜索提示
+        if [[ -n "$search_input" ]]; then
+            echo -en "\033[$((line_num+1))H"
+            echo -e "  ${YELLOW}搜索: $search_input${RESET}"
+        fi
+
+        # 读取按键
+        echo -en "$CURSOR_HIDE"
+        local key
+        IFS= read -rsn1 key
+
+        if [[ "$key" == $'\x1b' ]]; then
+            read -rsn2 -t 0.1 rest
+            case "$rest" in
+                '[A'|'[H') # Up / Home
+                    if (( cursor > 0 )); then
+                        (( cursor-- ))
+                    fi
+                    ;;
+                '[B'|'[F') # Down / End
+                    if (( cursor < display_count - 1 )); then
+                        (( cursor++ ))
+                    fi
+                    ;;
+                '[5') # Page Up
+                    (( cursor -= visible_lines ))
+                    (( cursor < 0 )) && cursor=0
+                    ;;
+                '[6') # Page Down
+                    (( cursor += visible_lines ))
+                    (( cursor >= display_count )) && cursor=$((display_count - 1))
+                    ;;
+                *) # Esc
+                    echo -en "$CURSOR_SHOW"
+                    _ret=-2
+                    return
+                    ;;
+            esac
+        elif [[ "$key" == $'\n' || "$key" == $'\r' ]]; then
+            echo -en "$CURSOR_SHOW"
+            if (( display_count > 0 )); then
+                _ret=${filtered_indices[$cursor]}
+            else
+                _ret=-1
+            fi
+            return
+        elif [[ "$key" == "b" || "$key" == "B" ]]; then
+            echo -en "$CURSOR_SHOW"
+            _ret=-1
+            return
+        elif [[ "$key" == "q" || "$key" == "Q" ]]; then
+            echo -en "$CURSOR_SHOW"
+            _ret=-2
+            return
+        elif [[ "$key" == "j" ]]; then
+            if (( cursor < display_count - 1 )); then
+                (( cursor++ ))
+            fi
+        elif [[ "$key" == "k" ]]; then
+            if (( cursor > 0 )); then
+                (( cursor-- ))
+            fi
+        elif [[ "$key" == $'\x7f' || "$key" == $'\x08' ]]; then
+            # Backspace
+            if [[ -n "$search_input" ]]; then
+                search_input="${search_input%?}"
+                # 重新过滤
+                filtered_indices=()
+                for ((i=0; i<total; i++)); do
+                    if echo "${items[$i]}" | grep -qi "$search_input"; then
+                        filtered_indices+=($i)
+                    fi
+                done
+                cursor=0
+                scroll_offset=0
+            fi
+        elif [[ -n "$key" && ! "$key" =~ [0-9] ]]; then
+            # 普通字符 -> 搜索
+            search_input="${search_input}${key}"
+            filtered_indices=()
+            for ((i=0; i<total; i++)); do
+                if echo "${items[$i]}" | grep -qi "$search_input"; then
+                    filtered_indices+=($i)
+                fi
+            done
+            cursor=0
+            scroll_offset=0
+        elif [[ "$key" =~ [0-9] ]]; then
+            # 数字 -> 直接跳转
+            search_input="${search_input}${key}"
+            local num="$search_input"
+            if (( num >= 1 && num <= total )); then
+                echo -en "$CURSOR_SHOW"
+                _ret=$((num - 1))
+                return
+            fi
+        fi
+        echo -en "$CURSOR_SHOW"
+    done
+}
+
+# ── 搜索逻辑 ──────────────────────────────────────────────
+search_commands() {
+    local keyword="$1"
+    local results=()
+
+    # 第1级: 精确匹配模块名
+    for i in "${!MODULE_NAMES[@]}"; do
+        if [[ "${MODULE_NAMES[$i]}" == *"$keyword"* ]]; then
+            echo "MODULE:$i"
+            return
+        fi
+    done
+
+    # 第2级: 匹配模块 tags
+    for i in "${!MODULE_NAMES[@]}"; do
+        if echo "${MODULE_TAGS[$i]}" | grep -qi "$keyword"; then
+            echo "MODULE:$i"
+            return
+        fi
+    done
+
+    # 第3级: 搜索命令字符串
+    for mod in "${MODULE_NAMES[@]}"; do
+        local raw="${MODULE_DATA[$mod]}"
+        while IFS= read -r line; do
+            if [[ -n "$line" && "$line" != "##"* ]] && echo "$line" | grep -qi "$keyword"; then
+                results+=("$mod|$line")
+            fi
+        done <<< "$raw"
+    done
+
+    if (( ${#results[@]} > 0 )); then
+        printf '%s\n' "${results[@]}"
+    else
+        echo "NOT_FOUND"
+    fi
+}
+
+# ── 显示命令列表并选择 ────────────────────────────────────
+show_commands_and_select() {
+    local mod_name="$1"
+    local sub_name="$2"
+    local key="${mod_name}|${sub_name}"
+    local raw="${SUB_ITEMS[$key]}"
+
+    # 解析为命令数组
+    local -a cmd_items=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && cmd_items+=("$line")
+    done <<< "$raw"
+
+    if (( ${#cmd_items[@]} == 0 )); then
+        return 1
+    fi
+
+    # 显示
+    echo ""
+    print_breadcrumb "$mod_name > $sub_name"
+    print_separator
+
+    local selected
+    interactive_select "选择命令" cmd_items selected
+
+    case $selected in
+        -2) # 退出
+            echo ""
+            exit 0
+            ;;
+        -1) # 返回
+            return 1
+            ;;
+        *)
+            local item="${cmd_items[$selected]}"
+            local cmd="${item%%|*}"
+            copy_and_notify "$cmd" "$mod_name"
+            # 不退出，继续选择
+            show_commands_and_select "$mod_name" "$sub_name"
+            ;;
+    esac
+}
+
+# ── 复制并通知 ────────────────────────────────────────────
+copy_and_notify() {
+    local cmd="$1"
+    local src="${2:-}"
+
+    if copy_to_clipboard "$cmd"; then
+        echo ""
+        echo -e "  ${GREEN}✅ 已复制: ${BOLD}${cmd}${RESET}"
+        # 检查是否有参数占位符
+        if echo "$cmd" | grep -q '{'; then
+            echo -e "  ${YELLOW}💡 粘贴后替换 $(echo "$cmd" | grep -o '{[^}]*}') 即可使用${RESET}"
+        fi
+        echo ""
+    else
+        echo ""
+        echo -e "  ${CYAN}📋 ${BOLD}${cmd}${RESET}"
+        echo -e "  ${YELLOW}💡 剪贴板不可用，请手动复制以上命令${RESET}"
+        echo ""
+    fi
+
+    # 记录历史
+    local desc=""
+    # 从原始数据中查找描述
+    for mod in "${MODULE_NAMES[@]}"; do
+        local raw="${MODULE_DATA[$mod]}"
+        while IFS= read -r line; do
+            if [[ "$line" == "${cmd}|"* ]]; then
+                desc="${line#*|}"
+                break 2
+            fi
+        done <<< "$raw"
+    done
+    [[ -z "$desc" ]] && desc="自定义命令"
+    [[ -z "$src" ]] && src="搜索"
+    add_history "$cmd" "$desc" "$src"
+
+    # 保存到临时文件供 Shell 函数使用
+    echo "$cmd" > "$FAKE_CMD_FILE"
+}
+
+# ── 显示搜索结果并选择 ──────────────────────────────────
+show_search_results() {
+    local keyword="$1"
+    shift
+    local results=("$@")
+
+    echo ""
+    echo -e "  ${BOLD}搜索: \"${keyword}\" — 找到 ${#results[@]} 条${RESET}"
+    print_separator
+
+    local -a display_items=()
+    for r in "${results[@]}"; do
+        local item="${r#*|}"
+        display_items+=("$item")
+    done
+
+    local selected
+    interactive_select "选择命令" display_items selected
+
+    case $selected in
+        -2) exit 0 ;;
+        -1) return 1 ;;
+        *)
+            local item="${display_items[$selected]}"
+            local cmd="${item%%|*}"
+            local mod="${results[$selected]%%|*}"
+            copy_and_notify "$cmd" "$mod"
+            show_search_results "$keyword" "${results[@]}"
+            ;;
+    esac
+}
+
+# ── 显示子分类并选择 ──────────────────────────────────────
+show_subcategories() {
+    local mod_name="$1"
+    local subs="${SUBCATEGORIES[$mod_name]}"
+    local IFS_OLD="$IFS"
+    IFS='|'
+    local -a sub_list=($subs)
+    IFS="$IFS_OLD"
+
+    # 统计每个子分类的命令数
+    local -a display_items=()
+    for sub in "${sub_list[@]}"; do
+        local key="${mod_name}|${sub}"
+        local raw="${SUB_ITEMS[$key]}"
+        local count=0
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && ((count++))
+        done <<< "$raw"
+        display_items+=("$sub  ($count 条)")
+    done
+
+    echo ""
+    print_breadcrumb "$mod_name"
+    print_separator
+
+    local selected
+    interactive_select "选择子分类" display_items selected
+
+    case $selected in
+        -2) exit 0 ;;
+        -1) return 1 ;;
+        *)
+            show_commands_and_select "$mod_name" "${sub_list[$selected]}"
+            show_subcategories "$mod_name"
+            ;;
+    esac
+}
+
+# ── 主界面 ──────────────────────────────────────────────
+show_main() {
+    # 构建显示列表
+    local -a display_items=()
+
+    # 最近使用
+    load_history
+    if (( ${#HISTORY[@]} > 0 )); then
+        display_items+=("")
+        display_items+=("⏱ 最近使用:")
+        for h in "${HISTORY[@]}"; do
+            display_items+=("  $h")
+        done
+        display_items+=("")
+    fi
+
+    # 模块列表
+    for i in "${!MODULE_NAMES[@]}"; do
+        local mod="${MODULE_NAMES[$i]}"
+        local subs="${SUBCATEGORIES[$mod]}"
+        local IFS_OLD="$IFS"
+        IFS='|'
+        local -a sub_list=($subs)
+        IFS="$IFS_OLD"
+        local total=0
+        for sub in "${sub_list[@]}"; do
+            local key="${mod}|${sub}"
+            local raw="${SUB_ITEMS[$key]}"
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && ((total++))
+            done <<< "$raw"
+        done
+        display_items+=("$mod  ($total 条)")
+    done
+
+    echo ""
+    print_header "fake - Linux 命令快速查询工具"
+    print_separator
+
+    # 记录 UI 起始行
+    UI_TOP=$(($(echo "$LINES" 2>/dev/null || tput lines 2>/dev/null || echo 24) - ${#display_items[@]} - 6))
+    (( UI_TOP < 1 )) && UI_TOP=1
+
+    local selected
+    interactive_select "选择" display_items selected
+
+    case $selected in
+        -2) exit 0 ;;
+        -1) return ;;
+        *)
+            local item="${display_items[$selected]}"
+            # 判断是最近使用还是模块
+            if [[ "$item" == "  "* ]]; then
+                # 最近使用记录
+                local cmd="${item#* }"
+                cmd="${cmd%%|*}"
+                copy_and_notify "$cmd" "最近使用"
+                show_main
+            else
+                # 模块
+                local mod_name="${item%% *}"
+                show_subcategories "$mod_name"
+                show_main
+            fi
+            ;;
+    esac
+}
+
+# ── 快捷跳转 fake 12 4 5 ─────────────────────────────────
+handle_quick_jump() {
+    local args=("$@")
+    local level1="${args[0]:-}"
+    local level2="${args[1]:-}"
+    local level3="${args[2]:-}"
+
+    # 第1级: 模块
+    if [[ "$level1" =~ ^[0-9]+$ ]] && (( level1 >= 1 && level1 <= ${#MODULE_NAMES[@]} )); then
+        local mod_name="${MODULE_NAMES[$((level1-1))]}"
+
+        # 第2级: 子分类
+        if [[ -n "$level2" && "$level2" =~ ^[0-9]+$ ]]; then
+            local subs="${SUBCATEGORIES[$mod_name]}"
+            local IFS_OLD="$IFS"
+            IFS='|'
+            local -a sub_list=($subs)
+            IFS="$IFS_OLD"
+
+            if (( level2 >= 1 && level2 <= ${#sub_list[@]} )); then
+                local sub_name="${sub_list[$((level2-1))]}"
+
+                # 第3级: 命令
+                if [[ -n "$level3" && "$level3" =~ ^[0-9]+$ ]]; then
+                    local key="${mod_name}|${sub_name}"
+                    local raw="${SUB_ITEMS[$key]}"
+                    local -a cmd_items=()
+                    while IFS= read -r line; do
+                        [[ -n "$line" ]] && cmd_items+=("$line")
+                    done <<< "$raw"
+
+                    if (( level3 >= 1 && level3 <= ${#cmd_items[@]} )); then
+                        local item="${cmd_items[$((level3-1))]}"
+                        local cmd="${item%%|*}"
+                        copy_and_notify "$cmd" "$mod_name"
+                        exit 0
+                    fi
+                fi
+
+                # 没有第3级，显示命令列表
+                show_commands_and_select "$mod_name" "$sub_name"
+                exit 0
+            fi
+        fi
+
+        # 没有第2级，显示子分类
+        show_subcategories "$mod_name"
+        exit 0
+    fi
+}
+
+# ── 特殊命令处理 ──────────────────────────────────────────
+handle_special() {
+    case "${1:-}" in
+        --detect)
+            detect_system
+            detect_clipboard
+            save_config
+            echo -e "  ${GREEN}✅ 系统配置已更新${RESET}"
+            echo -e "  SYS_TAG=$SYS_TAG"
+            echo -e "  CLIP_CMD=$CLIP_CMD"
+            exit 0
+            ;;
+        --inject)
+            inject_shell_func
+            exit 0
+            ;;
+        --doctor)
+            run_doctor
+            exit 0
+            ;;
+        --update)
+            echo -e "  ${YELLOW}⚠ 更新功能需要网络连接，请从 GitHub 获取最新版本${RESET}"
+            exit 0
+            ;;
+        -h|--help|help)
+            show_help
+            exit 0
+            ;;
+        -l|--list)
+            for i in "${!MODULE_NAMES[@]}"; do
+                echo "  [$((i+1))] ${MODULE_NAMES[$i]}"
+            done
+            exit 0
+            ;;
+    esac
+}
+
+show_help() {
+    echo -e "${BOLD}${CYAN}"
+    echo "  fake - Linux 命令快速查询工具 v$VERSION"
+    echo -e "${RESET}"
+    echo ""
+    echo -e "  ${BOLD}用法:${RESET}"
+    echo "    fake                    列出所有模块"
+    echo "    fake {关键词}           搜索命令（支持中英文）"
+    echo "    fake 12 4 5             快捷跳转 模块>子分类>命令"
+    echo ""
+    echo -e "  ${BOLD}操作:${RESET}"
+    echo "    ↑↓ / j/k               移动光标"
+    echo "    回车                    复制/进入"
+    echo "    b                       返回上级"
+    echo "    q / Esc / Ctrl+C        退出"
+    echo "    直接输入文字            搜索"
+    echo "    直接输入数字            跳转到对应编号"
+    echo ""
+    echo -e "  ${BOLD}维护:${RESET}"
+    echo "    fake --detect           重新检测系统"
+    echo "    fake --inject           重新注入 Shell 函数"
+    echo "    fake --doctor           运行诊断"
+    echo "    fake -h                 显示帮助"
+}
+
+inject_shell_func() {
+    local target="$HOME/.bashrc"
+    [[ -n "${ZSH_VERSION:-}" ]] && target="$HOME/.zshrc"
+
+    if grep -q "_fake_init" "$target" 2>/dev/null; then
+        echo -e "  ${YELLOW}⚠ Shell 函数已存在，无需重复注入${RESET}"
+        return
+    fi
+
+    cat >> "$target" << 'SHELLFUNC'
+
+# fake - 快速预填上次复制的命令
+_fake_init() {
+    if [[ -f /tmp/_fake_cmd ]]; then
+        local cmd=$(cat /tmp/_fake_cmd 2>/dev/null)
+        if [[ -n "$cmd" ]]; then
+            READLINE_LINE="$cmd"
+            READLINE_POINT=${#cmd}
+        fi
+    fi
+}
+bind -x '"\C-f":_fake_init' 2>/dev/null || true
+SHELLFUNC
+
+    echo -e "  ${GREEN}✅ Shell 函数已注入 $target${RESET}"
+    echo -e "  ${GRAY}按 Ctrl+F 可快速预填上次复制的命令${RESET}"
+}
+
+run_doctor() {
+    local ok=0
+    local fail=0
+    echo ""
+    echo -e "  ${BOLD}══════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}  fake 诊断报告${RESET}"
+    echo -e "  ${BOLD}══════════════════════════════════════${RESET}"
+
+    # 1. 程序路径
+    local fake_path
+    fake_path=$(command -v fake 2>/dev/null || true)
+    if [[ -n "$fake_path" ]]; then
+        echo -e "  ${GREEN}[✓]${RESET} 程序路径          $fake_path"
+        ok=$((ok+1))
+    else
+        echo -e "  ${RED}[✗]${RESET} 程序路径          未找到"
+        fail=$((fail+1))
+    fi
+
+    # 2. 执行权限
+    if [[ -x "$fake_path" ]]; then
+        echo -e "  ${GREEN}[✓]${RESET} 执行权限          正常"
+        ok=$((ok+1))
+    else
+        echo -e "  ${RED}[✗]${RESET} 执行权限          无执行权限"
+        echo -e "       ${GRAY}修复: sudo chmod +x $fake_path${RESET}"
+        fail=$((fail+1))
+    fi
+
+    # 3. 系统配置
+    if [[ -f "$CONF_FILE" ]]; then
+        echo -e "  ${GREEN}[✓]${RESET} 系统配置          $SYS_TAG (v$SYS_VERSION_ID)"
+        ok=$((ok+1))
+    else
+        echo -e "  ${RED}[✗]${RESET} 系统配置          缓存文件不存在"
+        echo -e "       ${GRAY}修复: fake --detect${RESET}"
+        fail=$((fail+1))
+    fi
+
+    # 4. 剪贴板
+    if [[ -n "$CLIP_CMD" ]] && command -v "$CLIP_CMD" &>/dev/null; then
+        echo -e "  ${GREEN}[✓]${RESET} 剪贴板工具        $CLIP_CMD"
+        ok=$((ok+1))
+    else
+        echo -e "  ${YELLOW}[!]${RESET} 剪贴板工具        不可用（不影响使用）"
+        echo -e "       ${GRAY}安装: sudo apt install xclip${RESET}"
+        fail=$((fail+1))
+    fi
+
+    # 5. Shell 函数
+    local shell_rc="$HOME/.bashrc"
+    [[ -n "${ZSH_VERSION:-}" ]] && shell_rc="$HOME/.zshrc"
+    if grep -q "_fake_init" "$shell_rc" 2>/dev/null; then
+        echo -e "  ${GREEN}[✓]${RESET} Shell 函数        已注入 $shell_rc"
+        ok=$((ok+1))
+    else
+        echo -e "  ${YELLOW}[!]${RESET} Shell 函数        未注入"
+        echo -e "       ${GRAY}修复: fake --inject${RESET}"
+        fail=$((fail+1))
+    fi
+
+    # 6. 历史文件
+    if [[ -f "$HISTORY_FILE" ]]; then
+        echo -e "  ${GREEN}[✓]${RESET} 历史记录          正常"
+        ok=$((ok+1))
+    else
+        echo -e "  ${YELLOW}[!]${RESET} 历史记录          暂无（使用后会自动创建）"
+        ok=$((ok+1))
+    fi
+
+    # 7. Bash 版本
+    local bash_ver="${BASH_VERSION:-unknown}"
+    echo -e "  ${GREEN}[✓]${RESET} Bash 版本          $bash_ver"
+    ok=$((ok+1))
+
+    echo -e "  ${BOLD}══════════════════════════════════════${RESET}"
+    local total=$((ok + fail))
+    if (( fail == 0 )); then
+        echo -e "  ${GREEN}状态: 一切正常 ($ok/$total)${RESET}"
+    else
+        echo -e "  ${YELLOW}状态: 基本可用 ($ok/$total)${RESET}"
+    fi
+    echo -e "  ${BOLD}══════════════════════════════════════${RESET}"
+    echo ""
+}
+
+# ── 自我修复 ──────────────────────────────────────────────
+self_repair() {
+    # 权限修复
+    if [[ ! -x "${BASH_SOURCE[0]}" ]]; then
+        chmod +x "${BASH_SOURCE[0]}" 2>/dev/null && \
+            echo -e "  ${YELLOW}⚠ 权限异常，已自动修复${RESET}"
+    fi
+}
+
+# ── 主入口 ────────────────────────────────────────────────
+main() {
+    self_repair
+    load_config
+    init_commands
+    parse_all_modules
+
+    # 处理特殊命令
+    handle_special "${1:-}"
+
+    # 处理快捷跳转（纯数字参数）
+    if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+        handle_quick_jump "$@"
+        exit 0
+    fi
+
+    # 处理关键词搜索
+    if [[ -n "${1:-}" ]]; then
+        local result
+        result=$(search_commands "$1")
+
+        if [[ "$result" == "NOT_FOUND" ]]; then
+            echo ""
+            echo -e "  ${YELLOW}未找到与 \"$1\" 相关的命令${RESET}"
+            echo -e "  ${GRAY}试试其他关键词，或直接输入 fake 浏览所有模块${RESET}"
+            echo ""
+            exit 0
+        elif [[ "$result" == MODULE:* ]]; then
+            local mod_idx="${result#MODULE:}"
+            show_subcategories "${MODULE_NAMES[$mod_idx]}"
+            exit 0
+        else
+            local -a results=()
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && results+=("$line")
+            done <<< "$result"
+            show_search_results "$1" "${results[@]}"
+            exit 0
+        fi
+    fi
+
+    # 默认: 显示主界面
+    show_main
+}
+
+main "$@"
